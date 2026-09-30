@@ -10,7 +10,7 @@
 #include <linux/blk-mq-dma.h>
 #include <linux/blk-integrity.h>
 #include <linux/dmi.h>
-#include <linux/dma-map-ops.h>
+#include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -304,6 +304,11 @@ struct nvme_descriptor_pools {
 	struct dma_pool *small;
 };
 
+struct nvme_t8010_dma_segment {
+	dma_addr_t dma;
+	unsigned int len;
+};
+
 /*
  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
  */
@@ -336,6 +341,7 @@ struct nvme_dev {
 	spinlock_t t8010_lock;
 	DECLARE_BITMAP(t8010_slots, T8010_NVMMU_TAGS);
 	u64 *t8010_pages;
+	struct nvme_t8010_dma_segment *t8010_segments;
 	u32 t8010_scratch_dma;
 	u32 t8010_scratch_size;
 
@@ -457,7 +463,7 @@ struct nvme_iod {
 	struct nvme_command cmd;
 	u8 flags;
 	s8 t8010_slot;
-	bool t8010_data_synced;
+	u16 t8010_dma_nents;
 	u8 nr_descriptors;
 
 	size_t total_len;
@@ -962,26 +968,23 @@ static void nvme_t8010_unmap_data(struct request *req)
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	struct nvme_dev *dev = nvmeq->dev;
-	struct req_iterator iter;
-	struct bio_vec bvec;
+	struct nvme_t8010_dma_segment *segments;
 	unsigned long flags;
+	unsigned int i;
 	int slot = iod->t8010_slot;
 
 	if (slot < 0)
 		return;
 	apple_pcie_t8010_nvmmu_map(to_pci_dev(dev->dev), slot, 0, NULL);
-	if (iod->t8010_data_synced) {
-		rq_for_each_segment(bvec, req, iter)
-			arch_sync_dma_for_cpu(page_to_phys(bvec.bv_page) +
-					bvec.bv_offset, bvec.bv_len,
-					rq_dma_dir(req));
-		arch_sync_dma_flush();
-		arch_sync_dma_for_cpu_all();
-	}
+	segments = dev->t8010_segments + slot * T8010_NVMMU_PAGES;
+	for (i = 0; i < iod->t8010_dma_nents; i++)
+		dma_unmap_page(dev->dev, segments[i].dma, segments[i].len,
+			       rq_dma_dir(req));
 	spin_lock_irqsave(&dev->t8010_lock, flags);
 	__clear_bit(slot, dev->t8010_slots);
 	spin_unlock_irqrestore(&dev->t8010_lock, flags);
 	iod->t8010_slot = -1;
+	iod->t8010_dma_nents = 0;
 }
 
 static void nvme_unmap_data(struct request *req)
@@ -1307,6 +1310,7 @@ static blk_status_t nvme_t8010_map_data(struct request *req)
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	struct nvme_dev *dev = nvmeq->dev;
+	struct nvme_t8010_dma_segment *segments;
 	struct req_iterator iter;
 	struct bio_vec bvec;
 	unsigned long flags;
@@ -1324,6 +1328,7 @@ static blk_status_t nvme_t8010_map_data(struct request *req)
 		return BLK_STS_RESOURCE;
 	iod->t8010_slot = slot;
 	pages = dev->t8010_pages + slot * T8010_NVMMU_PAGES;
+	segments = dev->t8010_segments + slot * T8010_NVMMU_PAGES;
 
 	rq_for_each_segment(bvec, req, iter) {
 		if (is_pci_p2pdma_page(bvec.bv_page))
@@ -1351,13 +1356,19 @@ static blk_status_t nvme_t8010_map_data(struct request *req)
 	}
 	if (!npages)
 		goto invalid;
-	if (!dev_is_dma_coherent(dev->dev)) {
-		rq_for_each_segment(bvec, req, iter)
-			arch_sync_dma_for_device(page_to_phys(bvec.bv_page) +
-					   bvec.bv_offset, bvec.bv_len,
-					   rq_dma_dir(req));
-		arch_sync_dma_flush();
-		iod->t8010_data_synced = true;
+	/* The DMA mappings sync caches; NVMMU uses physical page addresses. */
+	rq_for_each_segment(bvec, req, iter) {
+		struct nvme_t8010_dma_segment *seg;
+
+		if (iod->t8010_dma_nents >= T8010_NVMMU_PAGES)
+			goto invalid;
+		seg = &segments[iod->t8010_dma_nents];
+		seg->dma = dma_map_page(dev->dev, bvec.bv_page, bvec.bv_offset,
+					bvec.bv_len, rq_dma_dir(req));
+		if (dma_mapping_error(dev->dev, seg->dma))
+			goto invalid;
+		seg->len = bvec.bv_len;
+		iod->t8010_dma_nents++;
 	}
 	address = apple_pcie_t8010_nvmmu_map(to_pci_dev(dev->dev),
 					    slot, npages, pages);
@@ -1537,7 +1548,7 @@ static blk_status_t nvme_prep_rq(struct request *req)
 
 	iod->flags = 0;
 	iod->t8010_slot = -1;
-	iod->t8010_data_synced = false;
+	iod->t8010_dma_nents = 0;
 	iod->nr_descriptors = 0;
 	iod->total_len = 0;
 	iod->meta_total_len = 0;
@@ -3568,6 +3579,7 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
 
 	nvme_free_tagset(dev);
 	kvfree(dev->t8010_pages);
+	kvfree(dev->t8010_segments);
 	put_device(dev->dev);
 	kfree(dev->queues);
 	kfree(dev);
@@ -3976,7 +3988,11 @@ static int nvme_t8010_init(struct nvme_dev *dev)
 		return ret;
 	dev->t8010_pages = kvcalloc(T8010_NVMMU_TAGS * T8010_NVMMU_PAGES,
 				   sizeof(*dev->t8010_pages), GFP_KERNEL);
-	return dev->t8010_pages ? 0 : -ENOMEM;
+	if (!dev->t8010_pages)
+		return -ENOMEM;
+	dev->t8010_segments = kvcalloc(T8010_NVMMU_TAGS * T8010_NVMMU_PAGES,
+					sizeof(*dev->t8010_segments), GFP_KERNEL);
+	return dev->t8010_segments ? 0 : -ENOMEM;
 }
 
 static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
