@@ -183,6 +183,9 @@ enum nvme_quirks {
 	 * Admin queue DMA buffers must be page aligned
 	 */
 	NVME_QUIRK_ADMIN_PAGE_ALIGN		= (1 << 23),
+
+	/* T8010/H9P PCIe NVMe uses an NVMMU flat-DMA descriptor. */
+	NVME_QUIRK_T8010_FLATDMA		= (1 << 24),
 };
 
 static inline char *nvme_quirk_name(enum nvme_quirks q)
@@ -236,6 +239,8 @@ static inline char *nvme_quirk_name(enum nvme_quirks q)
 		return "dmapool_align_512";
 	case NVME_QUIRK_ADMIN_PAGE_ALIGN:
 		return "admin_page_align";
+	case NVME_QUIRK_T8010_FLATDMA:
+		return "t8010_flatdma";
 	}
 
 	return "unknown";

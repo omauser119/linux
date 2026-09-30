@@ -1136,23 +1136,50 @@ static int apple_dart_def_domain_type(struct device *dev)
 #define CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR	0
 #endif
 #define DOORBELL_ADDR	(CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR & PAGE_MASK)
+#define T8010_DOORBELL_ADDR	0xbffff000
 
 static void apple_dart_get_resv_regions(struct device *dev,
 					struct list_head *head)
 {
 	if (IS_ENABLED(CONFIG_PCIE_APPLE) && dev_is_pci(dev)) {
 		struct iommu_resv_region *region;
+		struct pci_host_bridge *bridge;
+		struct device_node *host, *mem;
+		struct resource res;
+		u32 scratch_iova;
+		bool t8010;
 		int prot = IOMMU_WRITE | IOMMU_NOEXEC | IOMMU_MMIO;
 
-		region = iommu_alloc_resv_region(DOORBELL_ADDR,
+		bridge = pci_find_host_bridge(to_pci_dev(dev)->bus);
+		host = bridge && bridge->dev.parent ?
+			bridge->dev.parent->of_node : NULL;
+		t8010 = host && of_device_is_compatible(host, "apple,t8010-pcie");
+		region = iommu_alloc_resv_region(t8010 ? T8010_DOORBELL_ADDR :
+						 DOORBELL_ADDR,
 						 PAGE_SIZE, prot,
 						 IOMMU_RESV_MSI, GFP_KERNEL);
-		if (!region)
-			return;
+		if (region)
+			list_add_tail(&region->list, head);
 
-		list_add_tail(&region->list, head);
+		/* The T8010 SART owns this IOVA; DART must not allocate it. */
+		if (!t8010 || of_property_read_u32(host, "apple,scratch-iova",
+						&scratch_iova))
+			goto out;
+		mem = of_parse_phandle(host, "memory-region", 0);
+		if (!mem)
+			goto out;
+		if (!of_address_to_resource(mem, 0, &res)) {
+			region = iommu_alloc_resv_region(scratch_iova,
+					 resource_size(&res), IOMMU_READ |
+					 IOMMU_WRITE, IOMMU_RESV_RESERVED,
+					 GFP_KERNEL);
+			if (region)
+				list_add_tail(&region->list, head);
+		}
+		of_node_put(mem);
 	}
 
+out:
 	iommu_dma_get_resv_regions(dev, head);
 }
 

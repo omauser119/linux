@@ -10,6 +10,7 @@
 #include <linux/blk-mq-dma.h>
 #include <linux/blk-integrity.h>
 #include <linux/dmi.h>
+#include <linux/dma-map-ops.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -20,7 +21,9 @@
 #include <linux/mutex.h>
 #include <linux/nodemask.h>
 #include <linux/once.h>
+#include <linux/of_address.h>
 #include <linux/pci.h>
+#include <linux/pci-apple-t8010.h>
 #include <linux/suspend.h>
 #include <linux/t10-pi.h>
 #include <linux/types.h>
@@ -41,6 +44,18 @@
  * Arbitrary upper bound.
  */
 #define NVME_MAX_BYTES		SZ_8M
+#define T8010_NVMMU_TAGS	36
+#define T8010_NVMMU_PAGES	256
+#define T8010_MAX_SECTORS	256
+#define T8010_CMD_FLATDMA	BIT(5)
+#define T8010_REG_INIT		0x1800
+#define T8010_REG_SCRATCH_SIZE_REQ 0x1808
+#define T8010_REG_SCRATCH_ALIGN_REQ 0x180c
+#define T8010_REG_SCRATCH_BASE_LO 0x1810
+#define T8010_REG_SCRATCH_BASE_HI 0x1814
+#define T8010_REG_SCRATCH_SIZE 0x1818
+#define T8010_REG_BOOT_STATE	0x1b18
+#define T8010_BOOT_STATE_MAGIC	0xbfbfbfbf
 #define NVME_MAX_NR_DESCRIPTORS	5
 
 /*
@@ -318,6 +333,11 @@ struct nvme_dev {
 	bool hmb;
 	struct sg_table *hmb_sgt;
 	mempool_t *dmavec_mempool;
+	spinlock_t t8010_lock;
+	DECLARE_BITMAP(t8010_slots, T8010_NVMMU_TAGS);
+	u64 *t8010_pages;
+	u32 t8010_scratch_dma;
+	u32 t8010_scratch_size;
 
 	/* shadow doorbell buffer support: */
 	__le32 *dbbuf_dbs;
@@ -436,6 +456,8 @@ struct nvme_iod {
 	struct nvme_request req;
 	struct nvme_command cmd;
 	u8 flags;
+	s8 t8010_slot;
+	bool t8010_data_synced;
 	u8 nr_descriptors;
 
 	size_t total_len;
@@ -935,6 +957,33 @@ static void nvme_unmap_metadata(struct request *req)
 			      iod->meta_descriptor, iod->meta_dma);
 }
 
+static void nvme_t8010_unmap_data(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+	struct nvme_dev *dev = nvmeq->dev;
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	unsigned long flags;
+	int slot = iod->t8010_slot;
+
+	if (slot < 0)
+		return;
+	apple_pcie_t8010_nvmmu_map(to_pci_dev(dev->dev), slot, 0, NULL);
+	if (iod->t8010_data_synced) {
+		rq_for_each_segment(bvec, req, iter)
+			arch_sync_dma_for_cpu(page_to_phys(bvec.bv_page) +
+					bvec.bv_offset, bvec.bv_len,
+					rq_dma_dir(req));
+		arch_sync_dma_flush();
+		arch_sync_dma_for_cpu_all();
+	}
+	spin_lock_irqsave(&dev->t8010_lock, flags);
+	__clear_bit(slot, dev->t8010_slots);
+	spin_unlock_irqrestore(&dev->t8010_lock, flags);
+	iod->t8010_slot = -1;
+}
+
 static void nvme_unmap_data(struct request *req)
 {
 	enum pci_p2pdma_map_type map = PCI_P2PDMA_MAP_NONE;
@@ -942,6 +991,11 @@ static void nvme_unmap_data(struct request *req)
 	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
 	struct device *dma_dev = nvmeq->dev->dev;
 	unsigned int attrs = 0;
+
+	if (iod->t8010_slot >= 0) {
+		nvme_t8010_unmap_data(req);
+		return;
+	}
 
 	if (iod->flags & IOD_SINGLE_SEGMENT) {
 		static_assert(offsetof(union nvme_data_ptr, prp1) ==
@@ -1248,6 +1302,77 @@ static blk_status_t nvme_pci_setup_data_simple(struct request *req,
 	return BLK_STS_OK;
 }
 
+static blk_status_t nvme_t8010_map_data(struct request *req)
+{
+	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+	struct nvme_queue *nvmeq = req->mq_hctx->driver_data;
+	struct nvme_dev *dev = nvmeq->dev;
+	struct req_iterator iter;
+	struct bio_vec bvec;
+	unsigned long flags;
+	u64 *pages, address, phys;
+	u32 len, offset = 0;
+	unsigned int npages = 0;
+	int slot;
+
+	spin_lock_irqsave(&dev->t8010_lock, flags);
+	slot = find_first_zero_bit(dev->t8010_slots, T8010_NVMMU_TAGS);
+	if (slot < T8010_NVMMU_TAGS)
+		__set_bit(slot, dev->t8010_slots);
+	spin_unlock_irqrestore(&dev->t8010_lock, flags);
+	if (slot >= T8010_NVMMU_TAGS)
+		return BLK_STS_RESOURCE;
+	iod->t8010_slot = slot;
+	pages = dev->t8010_pages + slot * T8010_NVMMU_PAGES;
+
+	rq_for_each_segment(bvec, req, iter) {
+		if (is_pci_p2pdma_page(bvec.bv_page))
+			goto invalid;
+		phys = page_to_phys(bvec.bv_page) + bvec.bv_offset;
+		len = bvec.bv_len;
+		if (!npages) {
+			offset = phys & (NVME_CTRL_PAGE_SIZE - 1);
+			phys -= offset;
+			len += offset;
+		} else if (!IS_ALIGNED(phys, NVME_CTRL_PAGE_SIZE)) {
+			goto invalid;
+		}
+		if (!rq_iter_last(bvec, iter) &&
+		    !IS_ALIGNED(len, NVME_CTRL_PAGE_SIZE))
+			goto invalid;
+		while (len) {
+			if (npages >= T8010_NVMMU_PAGES)
+				goto invalid;
+			pages[npages++] = phys;
+			phys += NVME_CTRL_PAGE_SIZE;
+			len = len > NVME_CTRL_PAGE_SIZE ?
+				len - NVME_CTRL_PAGE_SIZE : 0;
+		}
+	}
+	if (!npages)
+		goto invalid;
+	if (!dev_is_dma_coherent(dev->dev)) {
+		rq_for_each_segment(bvec, req, iter)
+			arch_sync_dma_for_device(page_to_phys(bvec.bv_page) +
+					   bvec.bv_offset, bvec.bv_len,
+					   rq_dma_dir(req));
+		arch_sync_dma_flush();
+		iod->t8010_data_synced = true;
+	}
+	address = apple_pcie_t8010_nvmmu_map(to_pci_dev(dev->dev),
+					    slot, npages, pages);
+	if (!address)
+		goto invalid;
+
+	iod->cmd.common.flags |= T8010_CMD_FLATDMA;
+	iod->cmd.common.dptr.prp1 = cpu_to_le64(address + offset);
+	iod->cmd.common.dptr.prp2 = 0;
+	return BLK_STS_OK;
+invalid:
+	nvme_t8010_unmap_data(req);
+	return BLK_STS_IOERR;
+}
+
 static blk_status_t nvme_map_data(struct request *req)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
@@ -1256,6 +1381,9 @@ static blk_status_t nvme_map_data(struct request *req)
 	enum nvme_use_sgl use_sgl = nvme_pci_use_sgls(dev, req);
 	struct blk_dma_iter iter;
 	blk_status_t ret;
+
+	if (dev->ctrl.quirks & NVME_QUIRK_T8010_FLATDMA)
+		return nvme_t8010_map_data(req);
 
 	/*
 	 * Try to skip the DMA iterator for single segment requests, as that
@@ -1408,6 +1536,8 @@ static blk_status_t nvme_prep_rq(struct request *req)
 	blk_status_t ret;
 
 	iod->flags = 0;
+	iod->t8010_slot = -1;
+	iod->t8010_data_synced = false;
 	iod->nr_descriptors = 0;
 	iod->total_len = 0;
 	iod->meta_total_len = 0;
@@ -2344,6 +2474,38 @@ static int nvme_remap_bar(struct nvme_dev *dev, unsigned long size)
 	return 0;
 }
 
+static int nvme_t8010_preinit(struct nvme_dev *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	u32 size, align, state;
+
+	pci_write_config_byte(pdev, 0x00d, 0x40);
+	pci_write_config_dword(pdev, 0x17c, 0x10081008);
+	pci_write_config_dword(pdev, 0x18c, 0);
+	pci_write_config_dword(pdev, 0x188, 0x40550000);
+
+	state = readl(dev->bar + T8010_REG_BOOT_STATE);
+	if (state == T8010_BOOT_STATE_MAGIC)
+		dev_warn(dev->dev, "T8010 NVMe controller may need reset\n");
+	size = readl(dev->bar + T8010_REG_SCRATCH_SIZE_REQ);
+	align = readl(dev->bar + T8010_REG_SCRATCH_ALIGN_REQ);
+	if (size > dev->t8010_scratch_size || !is_power_of_2(align) ||
+	    !IS_ALIGNED(dev->t8010_scratch_dma, align)) {
+		dev_err(dev->dev, "invalid NVMe scratch request: %u bytes, alignment %u\n",
+			size, align);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static void nvme_t8010_preenable(struct nvme_dev *dev)
+{
+	writel(0, dev->bar + T8010_REG_INIT);
+	writel(dev->t8010_scratch_dma, dev->bar + T8010_REG_SCRATCH_BASE_LO);
+	writel(0, dev->bar + T8010_REG_SCRATCH_BASE_HI);
+	writel(dev->t8010_scratch_size, dev->bar + T8010_REG_SCRATCH_SIZE);
+}
+
 static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 {
 	int result;
@@ -2353,6 +2515,11 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 	result = nvme_remap_bar(dev, db_bar_size(dev, 0));
 	if (result < 0)
 		return result;
+	if (dev->ctrl.quirks & NVME_QUIRK_T8010_FLATDMA) {
+		result = nvme_remap_bar(dev, SZ_8K);
+		if (result)
+			return result;
+	}
 
 	dev->subsystem = readl(dev->bar + NVME_REG_VS) >= NVME_VS(1, 1, 0) ?
 				NVME_CAP_NSSRC(dev->ctrl.cap) : 0;
@@ -2391,6 +2558,11 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 		dev_info(dev->ctrl.device,
 			"controller reset completed after pcie flr\n");
 	}
+	if (dev->ctrl.quirks & NVME_QUIRK_T8010_FLATDMA) {
+		result = nvme_t8010_preinit(dev);
+		if (result)
+			return result;
+	}
 
 	result = nvme_alloc_queue(dev, 0, NVME_AQ_DEPTH);
 	if (result)
@@ -2405,6 +2577,8 @@ static int nvme_pci_configure_admin_queue(struct nvme_dev *dev)
 	writel(aqa, dev->bar + NVME_REG_AQA);
 	lo_hi_writeq(nvmeq->sq_dma_addr, dev->bar + NVME_REG_ASQ);
 	lo_hi_writeq(nvmeq->cq_dma_addr, dev->bar + NVME_REG_ACQ);
+	if (dev->ctrl.quirks & NVME_QUIRK_T8010_FLATDMA)
+		nvme_t8010_preenable(dev);
 
 	result = nvme_enable_ctrl(&dev->ctrl);
 	if (result)
@@ -3393,6 +3567,7 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
 	struct nvme_dev *dev = to_nvme_dev(ctrl);
 
 	nvme_free_tagset(dev);
+	kvfree(dev->t8010_pages);
 	put_device(dev->dev);
 	kfree(dev->queues);
 	kfree(dev);
@@ -3711,6 +3886,17 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 		goto out_free_dev;
 
 	dev->dev = get_device(&pdev->dev);
+	spin_lock_init(&dev->t8010_lock);
+	if (pdev->vendor == PCI_VENDOR_ID_APPLE && pdev->device == 0x2002) {
+		struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+
+		if (bridge && bridge->dev.parent &&
+		    of_device_is_compatible(bridge->dev.parent->of_node,
+					    "apple,t8010-pcie"))
+			quirks |= NVME_QUIRK_T8010_FLATDMA |
+				  NVME_QUIRK_SINGLE_VECTOR |
+				  NVME_QUIRK_SHARED_TAGS;
+	}
 
 	quirks |= check_vendor_combination_bug(pdev);
 	if (!noacpi &&
@@ -3748,6 +3934,9 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
 	dev->ctrl.max_hw_sectors = min_t(u32,
 			NVME_MAX_BYTES >> SECTOR_SHIFT,
 			dma_opt_mapping_size(&pdev->dev) >> 9);
+	if (quirks & NVME_QUIRK_T8010_FLATDMA)
+		dev->ctrl.max_hw_sectors = min_t(u32, dev->ctrl.max_hw_sectors,
+						T8010_MAX_SECTORS);
 	dev->ctrl.max_segments = NVME_MAX_SEGS;
 	dev->ctrl.max_integrity_segments = 1;
 	return dev;
@@ -3760,6 +3949,36 @@ out_free_dev:
 	return ERR_PTR(ret);
 }
 
+static int nvme_t8010_init(struct nvme_dev *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev->dev);
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+	struct device_node *host, *mem;
+	struct resource res;
+	int ret;
+
+	if (!bridge || !bridge->dev.parent)
+		return -ENODEV;
+	host = bridge->dev.parent->of_node;
+	mem = of_parse_phandle(host, "memory-region", 0);
+	if (!mem)
+		return -EINVAL;
+	ret = of_address_to_resource(mem, 0, &res);
+	of_node_put(mem);
+	if (ret)
+		return ret;
+	if (resource_size(&res) < SZ_1M || resource_size(&res) > U32_MAX)
+		return -EINVAL;
+	dev->t8010_scratch_size = resource_size(&res);
+	ret = of_property_read_u32(host, "apple,scratch-iova",
+				   &dev->t8010_scratch_dma);
+	if (ret)
+		return ret;
+	dev->t8010_pages = kvcalloc(T8010_NVMMU_TAGS * T8010_NVMMU_PAGES,
+				   sizeof(*dev->t8010_pages), GFP_KERNEL);
+	return dev->t8010_pages ? 0 : -ENOMEM;
+}
+
 static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct nvme_dev *dev;
@@ -3768,6 +3987,11 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dev = nvme_pci_alloc_dev(pdev, id);
 	if (IS_ERR(dev))
 		return PTR_ERR(dev);
+	if (dev->ctrl.quirks & NVME_QUIRK_T8010_FLATDMA) {
+		result = nvme_t8010_init(dev);
+		if (result)
+			goto out_put_ctrl;
+	}
 
 	result = nvme_add_ctrl(&dev->ctrl);
 	if (result)
@@ -4295,6 +4519,7 @@ static const struct pci_device_id nvme_id_table[] = {
 		 */
 		.driver_data = NVME_QUIRK_SINGLE_VECTOR |
 				NVME_QUIRK_QDEPTH_ONE },
+	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x2002) }, /* T8010/H9P NVMe */
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x2003) },
 	{ PCI_DEVICE(PCI_VENDOR_ID_APPLE, 0x2005),
 		.driver_data = NVME_QUIRK_SINGLE_VECTOR |

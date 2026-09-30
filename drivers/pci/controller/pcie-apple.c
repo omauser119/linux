@@ -19,6 +19,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
 #include <linux/iopoll.h>
@@ -28,8 +29,11 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/msi.h>
+#include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/pci-ecam.h>
+#include <linux/pci-apple-t8010.h>
+#include <linux/pm_domain.h>
 
 #include "pci-host-common.h"
 
@@ -145,8 +149,34 @@
  * driver has to know about it.
  */
 #define DOORBELL_ADDR		CONFIG_PCIE_APPLE_MSI_DOORBELL_ADDR
+#define T8010_DOORBELL_ADDR	0xbffff000
+
+/* T8010/H9P PCIe root complex and its port 0 NVMMU/SART. */
+#define T8010_NVMMU_TAGS	36
+#define T8010_NVMMU_PAGES	256
+#define T8010_NVMMU_TCB_CTRL	0x0004
+#define T8010_NVMMU_TCB_BASE_LO	0x0008
+#define T8010_NVMMU_TCB_BASE_HI	0x000c
+#define T8010_NVMMU_TCB_TABLE_LO	0x0010
+#define T8010_NVMMU_TCB_TABLE_HI	0x0014
+#define T8010_SART_CTRL		0x0020
+#define T8010_SART_VA_BASE	0x0024
+#define T8010_SART_VA_END	0x0028
+#define T8010_SART_PA_BASE	0x002c
+#define T8010_NVMMU_PERM_READ	0x100
+#define T8010_NVMMU_PERM_WRITE	0x200
+
+struct apple_t8010_tunable {
+	u32 offset;
+	u32 size;
+	u64 mask;
+	u64 data;
+};
+
+#include "pcie-apple-t8010-tunables.h"
 
 struct hw_info {
+	bool t8010;
 	u32 phy_lane_ctl;
 	u32 port_msiaddr;
 	u32 port_msiaddr_hi;
@@ -155,6 +185,13 @@ struct hw_info {
 	u32 port_rid2sid;
 	u32 port_msimap;
 	u32 max_rid2sid;
+};
+
+static const struct hw_info t8010_hw = {
+	.t8010			= true,
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_refclk		= PORT_REFCLK,
+	.port_perst		= PORT_PERST,
 };
 
 static const struct hw_info t8103_hw = {
@@ -190,6 +227,24 @@ struct apple_pcie {
 	struct completion	event;
 	struct irq_fwspec	fwspec;
 	u32			nvecs;
+	struct {
+		void __iomem *phy1;
+		void __iomem *phy2;
+		void __iomem *sart;
+		void __iomem *pwr;
+		struct pci_config_window *cfg;
+		struct device *pd_dev[3];
+		struct device_link *pd_link[3];
+		void *tcb;
+		void *tcb_table;
+		void *sgl;
+		dma_addr_t tcb_dma;
+		dma_addr_t tcb_table_dma;
+		dma_addr_t sgl_dma;
+		phys_addr_t scratch_phys;
+		u32 scratch_iova;
+		u32 scratch_size;
+	} t8010;
 };
 
 struct apple_pcie_port {
@@ -215,10 +270,195 @@ static void rmw_clear(u32 clr, void __iomem *addr)
 	writel_relaxed(readl_relaxed(addr) & ~clr, addr);
 }
 
+static void apple_t8010_apply_tunables(void __iomem *base,
+				       const struct apple_t8010_tunable *t,
+				       size_t count)
+{
+	size_t i;
+	u32 val;
+
+	for (i = 0; i < count; i++) {
+		val = readl(base + t[i].offset);
+		val = (val & ~(u32)t[i].mask) | (u32)t[i].data;
+		writel(val, base + t[i].offset);
+	}
+}
+
+static void apple_t8010_detach_domains(void *data)
+{
+	struct apple_pcie *pcie = data;
+	int i;
+
+	for (i = ARRAY_SIZE(pcie->t8010.pd_dev) - 1; i >= 0; i--) {
+		if (pcie->t8010.pd_link[i])
+			device_link_del(pcie->t8010.pd_link[i]);
+		if (!IS_ERR_OR_NULL(pcie->t8010.pd_dev[i]))
+			dev_pm_domain_detach(pcie->t8010.pd_dev[i], true);
+	}
+}
+
+static int apple_t8010_attach_domains(struct apple_pcie *pcie)
+{
+	struct device *dev = pcie->dev;
+	int i, ret;
+
+	/* The reference and auxiliary gates must be on before the core. */
+	for (i = 0; i < ARRAY_SIZE(pcie->t8010.pd_dev); i++) {
+		pcie->t8010.pd_dev[i] = dev_pm_domain_attach_by_id(dev, i);
+		if (IS_ERR(pcie->t8010.pd_dev[i])) {
+			ret = PTR_ERR(pcie->t8010.pd_dev[i]);
+			pcie->t8010.pd_dev[i] = NULL;
+			goto err;
+		}
+		pcie->t8010.pd_link[i] = device_link_add(dev,
+			pcie->t8010.pd_dev[i], DL_FLAG_STATELESS |
+			DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE);
+		if (!pcie->t8010.pd_link[i]) {
+			ret = -EINVAL;
+			goto err;
+		}
+	}
+
+	return devm_add_action_or_reset(dev, apple_t8010_detach_domains, pcie);
+err:
+	apple_t8010_detach_domains(pcie);
+	return ret;
+}
+
+static int apple_t8010_init(struct apple_pcie *pcie,
+			    struct platform_device *pdev)
+{
+	struct device *dev = pcie->dev;
+	struct device_node *mem;
+	struct resource res;
+	int ret;
+
+	ret = apple_t8010_attach_domains(pcie);
+	if (ret)
+		return ret;
+
+	pcie->t8010.phy1 = devm_platform_ioremap_resource_byname(pdev, "phy1");
+	pcie->t8010.phy2 = devm_platform_ioremap_resource_byname(pdev, "phy2");
+	pcie->t8010.sart = devm_platform_ioremap_resource_byname(pdev, "sart");
+	pcie->t8010.pwr = devm_platform_ioremap_resource_byname(pdev, "pwr");
+	if (IS_ERR(pcie->t8010.phy1))
+		return PTR_ERR(pcie->t8010.phy1);
+	if (IS_ERR(pcie->t8010.phy2))
+		return PTR_ERR(pcie->t8010.phy2);
+	if (IS_ERR(pcie->t8010.sart))
+		return PTR_ERR(pcie->t8010.sart);
+	if (IS_ERR(pcie->t8010.pwr))
+		return PTR_ERR(pcie->t8010.pwr);
+
+	mem = of_parse_phandle(dev->of_node, "memory-region", 0);
+	if (!mem)
+		return -EINVAL;
+	ret = of_address_to_resource(mem, 0, &res);
+	of_node_put(mem);
+	if (ret)
+		return ret;
+	if (!IS_ALIGNED(res.start, SZ_1M) ||
+	    resource_size(&res) < SZ_1M || resource_size(&res) > U32_MAX)
+		return -EINVAL;
+	pcie->t8010.scratch_phys = res.start;
+	pcie->t8010.scratch_size = resource_size(&res);
+	ret = of_property_read_u32(dev->of_node, "apple,scratch-iova",
+				   &pcie->t8010.scratch_iova);
+	if (ret || !IS_ALIGNED(pcie->t8010.scratch_iova, SZ_1M))
+		return -EINVAL;
+
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
+	if (ret)
+		return ret;
+	pcie->t8010.tcb = dmam_alloc_coherent(dev,
+		round_up(T8010_NVMMU_TAGS * 0x80, PAGE_SIZE),
+		&pcie->t8010.tcb_dma, GFP_KERNEL);
+	pcie->t8010.tcb_table = dmam_alloc_coherent(dev, PAGE_SIZE * 16,
+		&pcie->t8010.tcb_table_dma, GFP_KERNEL);
+	pcie->t8010.sgl = dmam_alloc_coherent(dev,
+		round_up(T8010_NVMMU_TAGS * T8010_NVMMU_PAGES * sizeof(u32),
+			 PAGE_SIZE), &pcie->t8010.sgl_dma, GFP_KERNEL);
+	if (!pcie->t8010.tcb || !pcie->t8010.tcb_table || !pcie->t8010.sgl)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int apple_t8010_setup_sart(struct apple_pcie *pcie)
+{
+	void __iomem *sart = pcie->t8010.sart;
+	u32 val;
+
+	writel(lower_32_bits(pcie->t8010.tcb_dma),
+	       sart + T8010_NVMMU_TCB_BASE_LO);
+	writel(upper_32_bits(pcie->t8010.tcb_dma),
+	       sart + T8010_NVMMU_TCB_BASE_HI);
+	writel(lower_32_bits(pcie->t8010.tcb_table_dma),
+	       sart + T8010_NVMMU_TCB_TABLE_LO);
+	writel(upper_32_bits(pcie->t8010.tcb_table_dma),
+	       sart + T8010_NVMMU_TCB_TABLE_HI);
+	writel(0x10000, sart + T8010_NVMMU_TCB_CTRL);
+	if (readl_poll_timeout(sart + T8010_NVMMU_TCB_CTRL, val,
+				!(val & 0x10), 1000, 250000))
+		return -ETIMEDOUT;
+
+	writel(pcie->t8010.scratch_iova - 0x80000000,
+	       sart + T8010_SART_VA_BASE);
+	writel(pcie->t8010.scratch_iova +
+	       round_up(pcie->t8010.scratch_size, SZ_1M) - 0x80100000,
+	       sart + T8010_SART_VA_END);
+	writel(pcie->t8010.scratch_phys >> 20, sart + T8010_SART_PA_BASE);
+	writel(1, sart + T8010_SART_CTRL);
+	return 0;
+}
+
+u64 apple_pcie_t8010_nvmmu_map(struct pci_dev *pdev, unsigned int tag,
+				unsigned int npages, const u64 *pages)
+{
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+	struct apple_pcie *pcie;
+	u32 *tcb, *sgl;
+	unsigned int i;
+
+	if (!bridge || !bridge->dev.parent || tag >= T8010_NVMMU_TAGS ||
+	    npages > T8010_NVMMU_PAGES)
+		return 0;
+	if (!of_device_is_compatible(bridge->dev.parent->of_node,
+				     "apple,t8010-pcie"))
+		return 0;
+	pcie = pci_host_bridge_priv(bridge);
+	if (!pcie->t8010.tcb)
+		return 0;
+
+	tcb = pcie->t8010.tcb + tag * 0x80;
+	sgl = pcie->t8010.sgl + tag * T8010_NVMMU_PAGES * sizeof(u32);
+	for (i = 0; i < npages; i++)
+		sgl[i] = pages[i] >> 12;
+	tcb[0] = T8010_NVMMU_PERM_READ | T8010_NVMMU_PERM_WRITE;
+	tcb[1] = npages;
+	tcb[2] = npages ? pages[0] >> 12 : 0;
+	((u64 *)tcb)[2] = pcie->t8010.sgl_dma +
+			  tag * T8010_NVMMU_PAGES * sizeof(u32);
+	dma_wmb();
+	if (!npages)
+		writel(tag, pcie->t8010.sart + T8010_NVMMU_TCB_CTRL);
+
+	return 0x40000000ULL + ((u64)tag << 23);
+}
+EXPORT_SYMBOL_GPL(apple_pcie_t8010_nvmmu_map);
+
+static u32 apple_pcie_doorbell_addr(const struct apple_pcie *pcie)
+{
+	return pcie->hw->t8010 ? T8010_DOORBELL_ADDR : DOORBELL_ADDR;
+}
+
 static void apple_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
 {
-	msg->address_hi = upper_32_bits(DOORBELL_ADDR);
-	msg->address_lo = lower_32_bits(DOORBELL_ADDR);
+	struct apple_pcie *pcie = irq_data_get_irq_chip_data(data);
+	u64 addr = apple_pcie_doorbell_addr(pcie);
+
+	msg->address_hi = upper_32_bits(addr);
+	msg->address_lo = lower_32_bits(addr);
 	msg->data = data->hwirq;
 }
 
@@ -550,6 +790,144 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 	return readl_relaxed(port_rid2sid_addr(port, idx));
 }
 
+static int apple_t8010_setup_port(struct apple_pcie_port *port,
+				   struct gpio_desc *reset)
+{
+	struct apple_pcie *pcie = port->pcie;
+	void __iomem *phy0 = pcie->base;
+	void __iomem *phy1 = pcie->t8010.phy1;
+	void __iomem *phy2 = pcie->t8010.phy2;
+	void __iomem *base = port->base;
+	void __iomem *cfg = pcie->t8010.cfg->win;
+	struct gpio_desc *debug;
+	u32 val, cap;
+	int ret;
+
+	if (port->idx)
+		return -EINVAL; /* Only the NVMe root port is described. */
+
+	debug = devm_gpiod_get_optional(pcie->dev, "debug", GPIOD_OUT_LOW);
+	if (IS_ERR(debug))
+		return PTR_ERR(debug);
+
+	/* Sandcastle's PMGR clock driver executes these after enabling PCIe. */
+	writel(7, pcie->t8010.pwr);
+	writel(0x80010005, pcie->t8010.pwr + 0xc);
+	writel(3, pcie->t8010.pwr + 0x4104);
+	writel(3, pcie->t8010.pwr + 0x4100);
+
+	ret = apple_t8010_setup_sart(pcie);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret, "NVMMU/SART did not start\n");
+
+	val = readl(base + PORT_LINKSTS);
+	if (((val >> 8) & 0x3f) < 0x11 || ((val >> 8) & 0x3f) > 0x14) {
+		gpiod_set_value_cansleep(reset, 1);
+		writel(0x10, phy0 + 0x4);
+		rmw_set(1, phy0 + 0x124);
+		ret = readl_poll_timeout(phy0 + 0x28, val,
+					 (val & 0x11) == 0x11, 1000, 250000);
+		if (ret)
+			return dev_err_probe(pcie->dev, ret, "PCIe PHY init timed out\n");
+		writel(1, phy0 + 0x34);
+		apple_t8010_apply_tunables(phy0, apple_t8010_phy_0_tunables,
+					    ARRAY_SIZE(apple_t8010_phy_0_tunables));
+		writel(1, phy0 + 0x14); /* NVMe mode on port 0 */
+		usleep_range(5000, 10000);
+		writel(1, phy0 + 0x24);
+		usleep_range(500, 1000);
+
+		rmw_clear(1, phy0 + 0x134);
+		rmw_set(1, phy0 + 0x124);
+		ret = readl_poll_timeout(phy0 + 0x28, val,
+					 val & 0x10, 1000, 250000);
+		if (ret)
+			return ret;
+		usleep_range(250, 1000);
+		rmw_set(1, phy0 + 0x100);
+		rmw_clear(0x100, phy0 + 0x100);
+		usleep_range(500, 1000);
+		rmw_set(1, phy0 + 0x134);
+		writel(3, phy0 + 0x4020);
+		rmw_clear(0x100, phy0 + 0x124);
+
+		/* Limit link training to Gen3 as in the HX implementation. */
+		cap = readb(cfg + PCI_CAPABILITY_LIST);
+		while (cap) {
+			u16 id = readw(cfg + cap);
+
+			if ((id & 0xff) == PCI_CAP_ID_EXP) {
+				val = readw(cfg + cap + PCI_EXP_LNKCTL2);
+				writew((val & ~0xf) | 3,
+				       cfg + cap + PCI_EXP_LNKCTL2);
+				break;
+			}
+			cap = id >> 8;
+		}
+		apple_t8010_apply_tunables(cfg, apple_t8010_config_tunables,
+					    ARRAY_SIZE(apple_t8010_config_tunables));
+		apple_t8010_apply_tunables(base, apple_t8010_port_tunables,
+					    ARRAY_SIZE(apple_t8010_port_tunables));
+		rmw_set(1, cfg + 0x8e0);
+
+		writel(0xff002fff, base + PORT_INTMSK);
+		writel(0x00ffd000, base + PORT_INTSTAT);
+		rmw_set(BIT(31), base + 0x140);
+		writel(0x31, base + PORT_MSICFG);
+		writel(0, base + PORT_MSIBASE);
+		usleep_range(250, 1000);
+		gpiod_set_value_cansleep(reset, 0);
+		usleep_range(250, 1000);
+
+		ret = readl_poll_timeout(phy1 + 0xc, val,
+					 val & 1, 1000, 250000);
+		if (ret)
+			return dev_err_probe(pcie->dev, ret, "PCIe port did not start\n");
+		rmw_set(0x4000, phy2 + 0x180);
+		rmw_set(0x4000, phy2 + 0x184);
+		writel((readl(phy2 + 0x90) & ~0xfff) | 100,
+		       phy2 + 0x90);
+		writel((readl(phy2 + 0x98) & ~0xfff) | 25,
+		       phy2 + 0x98);
+		rmw_set(0x4000, phy2 + 0x10088);
+		writel(0, phy2 + 0x10784);
+		writel((readl(phy2 + 0x10004) & ~0xfff) | 0x600,
+		       phy2 + 0x10004);
+		writel(0x3105, phy2 + 0x20788);
+		writel((readl(phy2 + 0x207a0) & ~0xff) | 0x9f,
+		       phy2 + 0x207a0);
+		writel((readl(phy2 + 0x207a8) & ~0xff) | 1,
+		       phy2 + 0x207a8);
+		writel((readl(phy2 + 0x20400) & ~0x1f) | 0xa,
+		       phy2 + 0x20400);
+		writel(175, phy2 + 0x2009c);
+		writel(175, phy2 + 0x200dc);
+		writel(333, phy2 + 0x200a0);
+		writel(333, phy2 + 0x200e0);
+		writel(530, phy2 + 0x200a4);
+		writel(530, phy2 + 0x200e4);
+		writel(0, phy2 + 0x20330);
+		writel(0, phy2 + 0x20340);
+		writel(0, phy2 + 0x20350);
+		usleep_range(5000, 10000);
+		rmw_set(PORT_LTSSMCTL_START, base + PORT_LTSSMCTL);
+	}
+
+	/* Port 0 exposes eight MSI vectors through AIC IRQs 288-295. */
+	writel(~0, base + PORT_INTMSK);
+	writel(~0, base + PORT_INTSTAT);
+	writel(apple_pcie_doorbell_addr(pcie), base + PORT_MSIADDR);
+	writel(0, base + PORT_MSIBASE);
+	writel(0x31, base + PORT_MSICFG);
+	ret = readl_poll_timeout(base + PORT_LINKSTS, val,
+				 ((val >> 8) & 0x3f) >= 0x11 &&
+				 ((val >> 8) & 0x3f) <= 0x14,
+				 1000, 500000);
+	if (ret)
+		dev_warn(pcie->dev, "T8010 NVMe PCIe link did not come up\n");
+	return 0;
+}
+
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
 				 struct device_node *np)
 {
@@ -570,9 +948,12 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (!port)
 		return -ENOMEM;
 
-	port->sid_map = devm_bitmap_zalloc(pcie->dev, pcie->hw->max_rid2sid, GFP_KERNEL);
-	if (!port->sid_map)
-		return -ENOMEM;
+	if (!pcie->hw->t8010) {
+		port->sid_map = devm_bitmap_zalloc(pcie->dev,
+					pcie->hw->max_rid2sid, GFP_KERNEL);
+		if (!port->sid_map)
+			return -ENOMEM;
+	}
 
 	ret = of_property_read_u32_index(np, "reg", 0, &idx);
 	if (ret)
@@ -593,6 +974,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	port->base = devm_ioremap_resource(&platform->dev, res);
 	if (IS_ERR(port->base))
 		return PTR_ERR(port->base);
+	if (pcie->hw->t8010)
+		return apple_t8010_setup_port(port, reset);
 
 	snprintf(name, sizeof(name), "phy%d", port->idx);
 	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
@@ -753,10 +1136,15 @@ static struct apple_pcie_port *apple_pcie_get_port(struct pci_dev *pdev)
 
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
 	u32 sid, rid = pci_dev_id(pdev);
 	struct apple_pcie_port *port;
 	struct of_phandle_args iommu_spec = {};
 	int idx, err;
+
+	/* T8010 routes port 0 to DART stream 0 without a RID/SID table. */
+	if (pcie->hw->t8010)
+		return 0;
 
 	port = apple_pcie_get_port(pdev);
 	if (!port)
@@ -790,9 +1178,13 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 
 static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
 	struct apple_pcie_port *port;
 	u32 rid = pci_dev_id(pdev);
 	int idx;
+
+	if (pcie->hw->t8010)
+		return;
 
 	port = apple_pcie_get_port(pdev);
 	if (!port)
@@ -824,6 +1216,8 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 	pcie = apple_pcie_lookup(dev);
 	if (WARN_ON(!pcie))
 		return -ENOENT;
+	if (pcie->hw->t8010)
+		pcie->t8010.cfg = cfg;
 
 	for_each_available_child_of_node_scoped(dev->of_node, of_port) {
 		ret = apple_pcie_setup_port(pcie, of_port);
@@ -837,6 +1231,7 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 }
 
 static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
+	.bus_shift	= 20,
 	.init		= apple_pcie_init,
 	.enable_device	= apple_pcie_enable_device,
 	.disable_device	= apple_pcie_disable_device,
@@ -863,6 +1258,11 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie->hw = of_device_get_match_data(dev);
 	if (!pcie->hw)
 		return -ENODEV;
+	if (pcie->hw->t8010) {
+		ret = apple_t8010_init(pcie, pdev);
+		if (ret)
+			return ret;
+	}
 	pcie->base = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(pcie->base))
 		return PTR_ERR(pcie->base);
@@ -878,6 +1278,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t8010-pcie",	.data = &t8010_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }

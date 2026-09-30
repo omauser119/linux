@@ -11,4 +11,12 @@
 / {
 	compatible = "apple,d111", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPhone 7 Plus (Intel)";
+
+	reserved-memory {
+		/* HX/H9P PCIe SART scratch area. */
+		nvme_scratch: nvme-scratch@8bee00000 {
+			reg = <0x8 0xbee00000 0 0x01200000>;
+			no-map;
+		};
+	};
 };

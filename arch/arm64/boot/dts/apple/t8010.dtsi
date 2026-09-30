@@ -276,6 +276,55 @@
 #endif
 		};
 
+		pcie0_dart: iommu@601008000 {
+			compatible = "apple,t8010-dart", "apple,s5l8960x-dart";
+			reg = <0x6 0x01008000 0 0x4000>;
+			interrupts = <AIC_IRQ 271 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <5>;
+			status = "disabled";
+		};
+
+		pcie0: pcie@610000000 {
+			compatible = "apple,t8010-pcie";
+			device_type = "pci";
+			reg = <0x6 0x10000000 0 0x1000000>,
+			      <0x6 0x00000000 0 0x8000>,
+			      <0x6 0x01000000 0 0x4000>,
+			      <0x6 0x00008000 0 0x4000>,
+			      <0x6 0x0a000000 0 0x40000>,
+			      <0x6 0x01004000 0 0x4000>,
+			      <0x6 0x00010000 0 0x8000>;
+			reg-names = "config", "rc", "port0", "phy1", "phy2",
+				    "sart", "pwr";
+			interrupts = <AIC_IRQ 270 IRQ_TYPE_LEVEL_HIGH>;
+			msi-controller;
+			msi-parent = <&pcie0>;
+			msi-ranges = <&aic AIC_IRQ 288 IRQ_TYPE_EDGE_RISING 8>;
+			bus-range = <0 1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x03000000 0 0xc0000000 0x7 0xc0000000
+				  0 0x40000000>;
+			/* T8010 PCIe DART maps bus IOVAs 0x80000000..0xbfffffff. */
+			iommu-map = <0x100 &pcie0_dart 0 0 0x80000000
+				     0 0x40000000 1>;
+			power-domains = <&ps_pcie_ref>, <&ps_pcie_aux>, <&ps_pcie>;
+			power-domain-names = "ref", "aux", "core";
+			pinctrl-0 = <&pcie_clkreq_pins>;
+			pinctrl-names = "default";
+			debug-gpios = <&pinctrl_ap 206 GPIO_ACTIVE_HIGH>;
+			status = "disabled";
+
+			port00: pci@0,0 {
+				device_type = "pci";
+				reg = <0 0 0 0 0>;
+				reset-gpios = <&pinctrl_ap 12 GPIO_ACTIVE_LOW>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+			};
+		};
+
 		pmgr: power-management@20e000000 {
 			compatible = "apple,t8010-pmgr", "apple,pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
@@ -338,6 +387,13 @@
 			i2c3_pins: i2c3-pins {
 				pinmux = <APPLE_PINMUX(41, 1)>,
 					 <APPLE_PINMUX(42, 1)>;
+			};
+
+			pcie_clkreq_pins: pcie-clkreq-pins {
+				pinmux = <APPLE_PINMUX(16, 1)>,
+					 <APPLE_PINMUX(17, 1)>,
+					 <APPLE_PINMUX(18, 1)>,
+					 <APPLE_PINMUX(19, 1)>;
 			};
 		};
 

@@ -42,6 +42,16 @@
 	};
 };
 
+&pcie0_dart {
+	status = "okay";
+};
+
+&pcie0 {
+	memory-region = <&nvme_scratch>;
+	apple,scratch-iova = <0xbc000000>;
+	status = "okay";
+};
+
 &framebuffer0 {
 	power-domains = <&ps_disp0_fe &ps_disp0_be &ps_mipi_dsi>;
 };

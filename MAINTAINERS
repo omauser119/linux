@@ -2057,6 +2057,8 @@ M:	Marc Zyngier <maz@kernel.org>
 L:	linux-pci@vger.kernel.org
 S:	Maintained
 F:	drivers/pci/controller/pcie-apple.c
+F:	drivers/pci/controller/pcie-apple-t8010-tunables.h
+F:	include/linux/pci-apple-t8010.h
 
 APPLE SMC DRIVER
 M:	Henrik Rydberg <rydberg@bitmath.org>
@@ -2652,6 +2654,7 @@ F:	Documentation/devicetree/bindings/nvmem/apple,efuses.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,pmic-nvmem.yaml
 F:	Documentation/devicetree/bindings/nvmem/apple,spmi-nvmem.yaml
 F:	Documentation/devicetree/bindings/pci/apple,pcie.yaml
+F:	Documentation/devicetree/bindings/pci/apple,t8010-pcie.yaml
 F:	Documentation/devicetree/bindings/phy/apple,atcphy.yaml
 F:	Documentation/devicetree/bindings/pinctrl/apple,pinctrl.yaml
 F:	Documentation/devicetree/bindings/power/apple*

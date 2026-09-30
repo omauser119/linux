@@ -11,4 +11,12 @@
 / {
 	compatible = "apple,d10", "apple,t8010", "apple,arm-platform";
 	model = "Apple iPhone 7 (Qualcomm)";
+
+	reserved-memory {
+		/* HX/H9P PCIe SART scratch area. */
+		nvme_scratch: nvme-scratch@87ee00000 {
+			reg = <0x8 0x7ee00000 0 0x01200000>;
+			no-map;
+		};
+	};
 };
