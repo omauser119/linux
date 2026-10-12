@@ -36,6 +36,7 @@
 #include <linux/pm_domain.h>
 
 #include "pci-host-common.h"
+#include "../pci.h"
 
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
@@ -790,6 +791,18 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 	return readl_relaxed(port_rid2sid_addr(port, idx));
 }
 
+static int apple_t8010_read_cfg_byte(void __iomem *cfg, int where, u8 *val)
+{
+	*val = readb(cfg + where);
+	return PCIBIOS_SUCCESSFUL;
+}
+
+static int apple_t8010_read_cfg_word(void __iomem *cfg, int where, u16 *val)
+{
+	*val = readw(cfg + where);
+	return PCIBIOS_SUCCESSFUL;
+}
+
 static int apple_t8010_setup_port(struct apple_pcie_port *port,
 				   struct gpio_desc *reset)
 {
@@ -852,18 +865,14 @@ static int apple_t8010_setup_port(struct apple_pcie_port *port,
 		rmw_clear(0x100, phy0 + 0x124);
 
 		/* Limit link training to Gen3 as in the HX implementation. */
-		cap = readb(cfg + PCI_CAPABILITY_LIST);
-		while (cap) {
-			u16 id = readw(cfg + cap);
-
-			if ((id & 0xff) == PCI_CAP_ID_EXP) {
-				val = readw(cfg + cap + PCI_EXP_LNKCTL2);
-				writew((val & ~0xf) | 3,
-				       cfg + cap + PCI_EXP_LNKCTL2);
-				break;
-			}
-			cap = id >> 8;
-		}
+		cap = PCI_FIND_NEXT_CAP(apple_t8010_read_cfg,
+					PCI_CAPABILITY_LIST, PCI_CAP_ID_EXP,
+					NULL, cfg);
+		if (!cap || cap + PCI_EXP_LNKCTL2 + sizeof(u16) > PCI_CFG_SPACE_SIZE)
+			return dev_err_probe(pcie->dev, -ENODEV,
+					     "Invalid or missing PCI Express capability\n");
+		val = readw(cfg + cap + PCI_EXP_LNKCTL2);
+		writew((val & ~0xf) | 3, cfg + cap + PCI_EXP_LNKCTL2);
 		apple_t8010_apply_tunables(cfg, apple_t8010_config_tunables,
 					    ARRAY_SIZE(apple_t8010_config_tunables));
 		apple_t8010_apply_tunables(base, apple_t8010_port_tunables,
